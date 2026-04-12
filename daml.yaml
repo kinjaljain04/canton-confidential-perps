@@ -1,0 +1,26 @@
+sdk-version: 3.4.0
+name: canton-confidential-perps
+version: 0.1.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+data-dependencies:
+  - .daml/dist/daml-finance-interface-issuance-0.3.0.dar
+  - .daml/dist/daml-finance-interface-holding-0.3.0.dar
+  - .daml/dist/daml-finance-interface-settlement-0.3.0.dar
+  - .daml/dist/daml-finance-interface-types-common-0.3.0.dar
+  - .daml/dist/daml-finance-interface-util-0.3.0.dar
+parties: []
+init-script: Main:initialize
+codegen:
+  js:
+    main: Main
+    output-dir: ui/daml.js
+    npm-scope: daml.js
+  java:
+    main: Main
+    output-dir: target/generated-sources
+    package-prefix: com.digitalasset
+build-options: ["--target=2.1"]
