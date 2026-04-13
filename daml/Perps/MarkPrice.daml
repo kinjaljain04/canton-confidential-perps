@@ -1,0 +1,248 @@
+module Perps.MarkPrice where
+
+import Daml.Script
+import DA.List (sort, length)
+import DA.Next.Set (Set, fromList, contains, union, difference)
+import DA.Time (Time)
+
+-- | A unique identifier for a financial asset, e.g., "ETH-USD".
+type AssetId = Text
+
+-- | An identifier for a time-based period for price aggregation.
+type Epoch = Int
+
+-- | Represents the authoritative, aggregated mark price for an asset in a given epoch.
+-- This contract is observable by all parties who need to value positions against it,
+-- such as traders and the liquidation engine.
+template MarkPrice
+  with
+    protocol: Party
+      -- ^ The operator of the perpetuals protocol.
+    asset: AssetId
+      -- ^ The asset for which this price is valid.
+    price: Decimal
+      -- ^ The aggregated median price.
+    epoch: Epoch
+      -- ^ The epoch number for which this price is valid.
+    timestamp: Time
+      -- ^ The time at which the price was aggregated.
+    observers: Set Party
+      -- ^ Parties who can observe this price data (e.g., traders, liquidators).
+  where
+    signatory protocol
+    observer observers
+
+    key (protocol, asset) : (Party, AssetId)
+    maintainer key._1
+
+    choice AddObservers : ContractId MarkPrice
+      with
+        newObservers: [Party]
+      controller protocol
+      do
+        create this with observers = this.observers `union` (fromList newObservers)
+
+    choice RemoveObservers : ContractId MarkPrice
+      with
+        observersToRemove: [Party]
+      controller protocol
+      do
+        create this with observers = this.observers `difference` (fromList observersToRemove)
+
+-- | A price data point submitted by a single authorized oracle for a specific epoch.
+-- These contracts are transient and are consumed during the price aggregation process.
+template PriceSubmission
+  with
+    oracle: Party
+      -- ^ The oracle submitting the price.
+    protocol: Party
+      -- ^ The protocol operator, who will aggregate the submission.
+    asset: AssetId
+      -- ^ The asset the price pertains to.
+    epoch: Epoch
+      -- ^ The epoch for the price submission.
+    price: Decimal
+      -- ^ The submitted price.
+    timestamp: Time
+      -- ^ The timestamp of the submission.
+  where
+    signatory oracle
+    observer protocol
+
+    ensure price > 0.0
+
+    key (protocol, asset, oracle, epoch) : (Party, AssetId, Party, Epoch)
+    maintainer key._3
+
+-- | Administrative contract for managing the mark price feed for a specific asset.
+-- It holds the configuration, such as the list of authorized oracles and the minimum
+-- number of submissions required to form a valid price.
+template MarkPriceAdmin
+  with
+    protocol: Party
+      -- ^ The protocol operator.
+    asset: AssetId
+      -- ^ The asset being managed.
+    oracles: Set Party
+      -- ^ The set of authorized oracles who can submit prices.
+    minSubmissions: Int
+      -- ^ The minimum number of oracle submissions required to update the mark price.
+  where
+    signatory protocol
+
+    key (protocol, asset) : (Party, AssetId)
+    maintainer key._1
+
+    -- | Allows the protocol to add new oracles to the authorized set.
+    choice AddOracles : ContractId MarkPriceAdmin
+      with
+        newOracles: [Party]
+      controller protocol
+      do
+        create this with oracles = this.oracles `union` (fromList newOracles)
+
+    -- | Allows the protocol to remove oracles from the authorized set.
+    choice RemoveOracles : ContractId MarkPriceAdmin
+      with
+        oraclesToRemove: [Party]
+      controller protocol
+      do
+        create this with oracles = this.oracles `difference` (fromList oraclesToRemove)
+
+    -- | The core logic for aggregating prices. The protocol calls this choice each epoch.
+    -- It fetches all valid submissions, calculates the median, archives the old mark price,
+    -- and creates a new one.
+    nonconsuming choice UpdateMarkPrice : ContractId MarkPrice
+      with
+        epoch: Epoch
+          -- ^ The epoch for which to aggregate prices.
+        timestamp: Time
+          -- ^ The current timestamp for the new aggregated price.
+        initialObservers: Set Party
+          -- ^ Observers for the price contract if it's being created for the first time.
+      controller protocol
+      do
+        -- Fetch all price submissions for the given asset and epoch.
+        allSubmissions <- query @PriceSubmission
+        let relevantSubmissions = filter (\(_, s) -> s.protocol == protocol && s.asset == asset && s.epoch == epoch) allSubmissions
+
+        -- Filter for submissions from authorized oracles only.
+        let authorizedSubmissions = filter (\(_, s) -> s.oracle `contains` oracles) relevantSubmissions
+        let submissionPrices = map (\(_, s) -> s.price) authorizedSubmissions
+
+        -- Validate submission count.
+        let submissionCount = length submissionPrices
+        assertMsg ("Insufficient oracle submissions: " <> show submissionCount <> "/" <> show minSubmissions)
+          (submissionCount >= minSubmissions)
+
+        -- Calculate the median price.
+        let medianPrice = calculateMedian submissionPrices
+
+        -- Archive the consumed submissions.
+        forA_ authorizedSubmissions (\(cid, _) -> archive cid)
+
+        -- Find the current mark price, if it exists.
+        currentMarkPriceOpt <- lookupByKey @MarkPrice (protocol, asset)
+
+        -- If a MarkPrice contract already exists, carry over its observers. Otherwise, use initialObservers.
+        let newObservers = case currentMarkPriceOpt of
+              Some cid -> (fetch cid).observers
+              None -> initialObservers
+
+        -- Archive the old mark price.
+        forA_ currentMarkPriceOpt archive
+
+        -- Create the new mark price contract.
+        create MarkPrice with
+          protocol
+          asset
+          price = medianPrice
+          epoch
+          timestamp
+          observers = newObservers
+
+-- | Calculates the median of a list of Decimals.
+-- Fails if the input list is empty.
+calculateMedian : [Decimal] -> Decimal
+calculateMedian prices =
+  let
+    sortedPrices = sort prices
+    n = length sortedPrices
+  in
+    if n == 0 then
+      error "Cannot calculate median of an empty list"
+    else if n `mod` 2 == 1 then
+      -- Odd number of elements: return the middle one.
+      sortedPrices !! (n / 2)
+    else
+      -- Even number of elements: return the average of the two middle ones.
+      let
+        mid1 = sortedPrices !! (n / 2 - 1)
+        mid2 = sortedPrices !! (n / 2)
+      in
+        (mid1 + mid2) / 2.0
+
+-- | Example setup script for testing the mark price mechanism.
+setup : Script ()
+setup = script do
+  protocol <- allocateParty "Protocol"
+  oracle1 <- allocateParty "Oracle1"
+  oracle2 <- allocateParty "Oracle2"
+  oracle3 <- allocateParty "Oracle3"
+  trader <- allocateParty "Trader"
+
+  let ethAsset = "ETH-USD"
+  let initialEpoch = 1
+  let initialOracles = fromList [oracle1, oracle2, oracle3]
+
+  -- Protocol sets up the admin contract for the ETH-USD price feed.
+  adminCid <- submit protocol do
+    createCmd MarkPriceAdmin with
+      protocol
+      asset = ethAsset
+      oracles = initialOracles
+      minSubmissions = 3
+
+  -- Oracles submit their prices for epoch 1.
+  now <- getTime
+  submit oracle1 do createCmd PriceSubmission with oracle = oracle1, protocol, asset = ethAsset, epoch = initialEpoch, price = 2000.10, timestamp = now
+  submit oracle2 do createCmd PriceSubmission with oracle = oracle2, protocol, asset = ethAsset, epoch = initialEpoch, price = 2000.50, timestamp = now
+  submit oracle3 do createCmd PriceSubmission with oracle = oracle3, protocol, asset = ethAsset, epoch = initialEpoch, price = 1999.90, timestamp = now
+
+  -- Protocol aggregates the prices and creates the first MarkPrice contract.
+  updateTime <- getTime
+  priceCid <- submit protocol do
+    exerciseCmd adminCid UpdateMarkPrice with
+      epoch = initialEpoch
+      timestamp = updateTime
+      initialObservers = fromList [trader]
+
+  -- Verify the created price.
+  priceContract <- fetch priceCid
+  assert (priceContract.price == 2000.10) -- Median of [1999.90, 2000.10, 2000.50]
+  assert (priceContract.epoch == initialEpoch)
+  assert (trader `contains` priceContract.observers)
+
+  -- In the next epoch, a new price is submitted and updated.
+  let nextEpoch = 2
+  updateTime2 <- getTime
+  submit oracle1 do createCmd PriceSubmission with oracle = oracle1, protocol, asset = ethAsset, epoch = nextEpoch, price = 2105.0, timestamp = updateTime2
+  submit oracle2 do createCmd PriceSubmission with oracle = oracle2, protocol, asset = ethAsset, epoch = nextEpoch, price = 2100.0, timestamp = updateTime2
+  submit oracle3 do createCmd PriceSubmission with oracle = oracle3, protocol, asset = ethAsset, epoch = nextEpoch, price = 2110.0, timestamp = updateTime2
+
+  updateTime3 <- getTime
+  newPriceCid <- submit protocol do
+    exerciseCmd adminCid UpdateMarkPrice with
+      epoch = nextEpoch
+      timestamp = updateTime3
+      initialObservers = fromList [] -- Not used as the contract already exists and observers are carried over.
+
+  newPriceContract <- fetch newPriceCid
+  assert (newPriceContract.price == 2105.0) -- Median of [2100.0, 2105.0, 2110.0]
+  assert (newPriceContract.epoch == nextEpoch)
+  assert (trader `contains` newPriceContract.observers) -- Observers are carried over.
+
+  -- Verify old price contract is archived
+  (try_ fetch priceCid) === None
+
+  pure ()
