@@ -1,0 +1,204 @@
+-- |
+-- Copyright (c) 2024, Digital Asset (Switzerland) GmbH and/or its affiliates.
+-- All rights reserved.
+--
+
+module Perps.Position where
+
+import Daml.Script
+import DA.Time (Time)
+import DA.Assert ((===))
+
+-- | Defines the side of a trade, either Long or Short.
+data Side = Long | Short
+  deriving (Eq, Show, Ord)
+
+-- | A data record to return a snapshot of a position's current state and health.
+-- This is used as a return type for view choices to provide calculated, off-ledger
+-- information without altering the contract itself.
+data PositionView = PositionView
+  with
+    operator: Party
+    trader: Party
+    marketId: Text
+    side: Side
+    size: Decimal              -- ^ The size of the position in the base asset.
+    collateral: Decimal          -- ^ The base collateral deposited by the trader.
+    entryPrice: Decimal
+    markPrice: Decimal           -- ^ The mark price used for this calculation.
+    pnl: Decimal                 -- ^ Calculated Profit and Loss.
+    fundingAccrued: Decimal
+    effectiveCollateral: Decimal -- ^ Base collateral + accrued funding.
+    marginValue: Decimal         -- ^ Effective collateral + P&L.
+    notionalValue: Decimal       -- ^ Current notional value (size * markPrice).
+    marginRatio: Decimal         -- ^ The ratio of margin value to notional value.
+    liquidationPrice: Decimal    -- ^ The calculated price at which the position would be liquidated.
+  deriving (Eq, Show)
+
+-- | Represents a trader's open perpetuals position in a specific market.
+-- The contract is confidential, visible only to the `trader` and the protocol `operator`.
+-- This privacy ensures that position details like size, entry price, and liquidation
+-- price are not exposed to the public, preventing front-running and targeted liquidations.
+template Position
+  with
+    operator: Party             -- ^ The protocol operator.
+    trader: Party               -- ^ The party holding the position.
+    marketId: Text              -- ^ Identifier for the market, e.g., "ETH-USD".
+    side: Side                  -- ^ The direction of the position: Long or Short.
+    size: Decimal               -- ^ Position size in base asset terms (e.g., amount of ETH). Must be positive.
+    collateral: Decimal         -- ^ Collateral deposited in quote asset terms (e.g., amount of USD). Must be positive.
+    entryPrice: Decimal         -- ^ The average entry price of the position. Must be positive.
+    fundingAccrued: Decimal     -- ^ Net funding paid (negative) or received (positive) over the life of the position.
+    lastFundingTimestamp: Time  -- ^ The timestamp of the last funding update.
+  where
+    signatory operator, trader
+
+    ensure
+      size > 0.0 &&
+      collateral > 0.0 &&
+      entryPrice > 0.0
+
+    -- A key is defined to ensure a trader can only have one position per market per side.
+    -- This simplifies position management and prevents fragmented positions.
+    -- The operator is the maintainer, as they are the central authority for the protocol.
+    key (operator, trader, marketId, side) : (Party, Party, Text, Side)
+    maintainer key._1
+
+    -- Calculates the Profit and Loss (P&L) for the position given a current mark price.
+    let calculatePnl markPrice =
+          case side of
+            Long  -> size * (markPrice - entryPrice)
+            Short -> size * (entryPrice - markPrice)
+
+    -- Calculates the price at which the position becomes eligible for liquidation.
+    let calculateLiquidationPrice' totalCollateral maintenanceMarginRate =
+          -- Ensure maintenance margin rate is a valid percentage.
+          assert (maintenanceMarginRate > 0.0 && maintenanceMarginRate < 1.0)
+          let
+            -- For Long: liqPrice = (size * entryPrice - totalCollateral) / (size * (1 - mmRate))
+            calcLong = (size * entryPrice - totalCollateral) / (size * (1.0 - maintenanceMarginRate))
+            -- For Short: liqPrice = (size * entryPrice + totalCollateral) / (size * (1 + mmRate))
+            calcShort = (size * entryPrice + totalCollateral) / (size * (1.0 + maintenanceMarginRate))
+          in
+            case side of
+              -- Liquidation price cannot be negative.
+              Long -> if calcLong < 0.0 then 0.0 else calcLong
+              Short -> if calcShort < 0.0 then 0.0 else calcShort
+
+    -- | A non-consuming choice that allows the trader or operator to query the
+    -- | current health and calculated metrics of the position.
+    nonconsuming choice View: PositionView
+      with
+        markPrice: Decimal
+        maintenanceMarginRate: Decimal
+      controller trader, operator
+      do
+        let pnl = calculatePnl markPrice
+        let effectiveCollateral = collateral + fundingAccrued
+        let marginValue = effectiveCollateral + pnl
+        let notionalValue = size * markPrice
+        let marginRatio = if notionalValue == 0.0 then 0.0 else marginValue / notionalValue
+        let liquidationPrice = calculateLiquidationPrice' effectiveCollateral maintenanceMarginRate
+        return PositionView with
+          operator, trader, marketId, side, size, collateral, entryPrice,
+          markPrice, pnl, fundingAccrued, effectiveCollateral, marginValue,
+          notionalValue, marginRatio, liquidationPrice
+
+    -- | Allows the trader to add or remove collateral from their position.
+    -- `delta` is positive to add collateral and negative to remove it.
+    choice AdjustCollateral: ContractId Position
+      with
+        delta: Decimal                 -- ^ Amount of collateral to add (+) or remove (-).
+        markPrice: Decimal             -- ^ Current mark price, used for margin checks.
+        maintenanceMarginRate: Decimal -- ^ The maintenance margin rate for the market.
+      controller trader
+      do
+        let newCollateral = collateral + delta
+        assertMsg "New collateral amount must be positive" $ newCollateral > 0.0
+
+        -- When removing collateral, we must ensure the position remains sufficiently capitalized
+        -- to avoid immediate liquidation. The new margin ratio must be above the maintenance level.
+        when (delta < 0.0) do
+          let newEffectiveCollateral = newCollateral + fundingAccrued
+          let pnl = calculatePnl markPrice
+          let newMarginValue = newEffectiveCollateral + pnl
+          let notionalValue = size * markPrice
+          let newMarginRatio = if notionalValue == 0.0 then 0.0 else newMarginValue / notionalValue
+
+          assertMsg "Withdrawal would bring margin ratio below maintenance level"
+            (newMarginRatio > maintenanceMarginRate)
+
+        create this with collateral = newCollateral
+
+    -- | Allows the operator to apply a funding payment to the position.
+    -- This is typically called periodically (e.g., every hour).
+    choice UpdateFunding: ContractId Position
+      with
+        fundingPayment: Decimal     -- ^ The funding payment for this period (+ve is received by trader).
+        updateTimestamp: Time       -- ^ The timestamp of this funding update.
+      controller operator
+      do
+        assertMsg "Update timestamp must be after the last funding timestamp" $
+          updateTimestamp > lastFundingTimestamp
+
+        create this with
+          fundingAccrued = fundingAccrued + fundingPayment
+          lastFundingTimestamp = updateTimestamp
+
+test = script do
+  op <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+
+  let now = time (DA.Date.date 2024 DA.Date.Jan 1) 0 0 0
+
+  let initialPos = Position with
+        operator = op
+        trader = alice
+        marketId = "ETH-USD"
+        side = Long
+        size = 10.0 -- 10 ETH
+        collateral = 2000.0 -- 2000 USD
+        entryPrice = 2000.0 -- Entered at $2000/ETH
+        fundingAccrued = 0.0
+        lastFundingTimestamp = now
+
+  posCid <- submit op do create initialPos
+
+  -- Test View choice
+  let markPrice1 = 2100.0
+  let mmRate = 0.05 -- 5%
+  view1 <- submit alice do exercise posCid View with markPrice = markPrice1, maintenanceMarginRate = mmRate
+
+  view1.pnl === 1000.0 -- 10.0 * (2100.0 - 2000.0)
+  view1.notionalValue === 21000.0 -- 10.0 * 2100.0
+  view1.marginValue === 3000.0 -- 2000.0 (collateral) + 1000.0 (pnl)
+  -- liqPrice = (10*2000 - 2000) / (10*(1-0.05)) = 18000 / 9.5 = 1894.7368421053
+  (round (view1.liquidationPrice * 10.0^10)) === 18947368421053
+
+  -- Test AdjustCollateral (add)
+  posCid2 <- submit alice do exercise posCid AdjustCollateral with delta = 500.0, markPrice = markPrice1, maintenanceMarginRate = mmRate
+
+  -- Test AdjustCollateral (remove) - should fail if it goes below maintenance
+  let markPrice2 = 1900.0
+  -- pnl = 10 * (1900 - 2000) = -1000
+  -- collateral = 2500
+  -- marginValue = 2500 - 1000 = 1500
+  -- notional = 10 * 1900 = 19000
+  -- marginRatio = 1500 / 19000 = 0.0789... which is > 0.05, so it's healthy
+  -- Let's try to remove 1000.
+  -- newCollateral = 1500
+  -- newMarginValue = 1500 - 1000 = 500
+  -- newMarginRatio = 500 / 19000 = 0.0263... which is < 0.05. This must fail.
+  submitMustFail alice do exercise posCid2 AdjustCollateral with delta = -1000.0, markPrice = markPrice2, maintenanceMarginRate = mmRate
+
+  -- A safe removal
+  posCid3 <- submit alice do exercise posCid2 AdjustCollateral with delta = -200.0, markPrice = markPrice2, maintenanceMarginRate = mmRate
+
+  -- Test UpdateFunding
+  let fundingTime = DA.Time.addRelTime now (seconds 3600)
+  posCid4 <- submit op do exercise posCid3 UpdateFunding with fundingPayment = -5.25, updateTimestamp = fundingTime
+
+  fetchedPos <- queryContractId alice posCid4
+  fetchedPos.fundingAccrued === -5.25
+
+  return ()
