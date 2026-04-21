@@ -1,0 +1,182 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Perps.FundingRate where
+
+import Daml.Script
+
+import DA.Assert ((assertMsg))
+import DA.Set (Set)
+import DA.Text (show)
+import DA.Time (Time, addRelTime, relTime)
+
+import Perps.Position (Data(..), Side(..))
+
+-- | Data representing the funding rates for an epoch.
+-- The funding payment for a position is its notional value multiplied by the corresponding rate.
+-- By convention:
+--   - Positive `longFundingRate`: longs pay shorts.
+--   - Negative `longFundingRate`: shorts pay longs.
+--   - `shortFundingRate` is typically `negate longFundingRate`.
+data FundingRateData = FundingRateData
+  with
+    longFundingRate  : Decimal
+      -- ^ The rate applied to long positions.
+    shortFundingRate : Decimal
+      -- ^ The rate applied to short positions.
+    epochTimestamp   : Time
+      -- ^ The UTC timestamp for which this funding rate was calculated.
+  deriving (Eq, Show, Ord)
+
+-- | Represents the official funding rate for a given market at a specific epoch.
+-- This contract is a single source of truth used by the protocol to calculate and
+-- distribute funding payments between long and short position holders. It is typically
+-- updated every funding epoch (e.g., every 8 hours).
+template FundingRate
+  with
+    protocol   : Party
+      -- ^ The party operating the perpetuals protocol, responsible for updates.
+    marketId   : Text
+      -- ^ Unique identifier for the market, e.g., "BTC-USD-PERP".
+    rateData   : FundingRateData
+      -- ^ The current funding rate data for the market.
+    observers  : Set Party
+      -- ^ A set of parties that can observe the funding rate (e.g., oracles, public).
+  where
+    signatory protocol
+    observer observers
+
+    key (protocol, marketId) : (Party, Text)
+    maintainer key._1
+
+    -- | Non-consuming choice to calculate the funding payment for a specific position based on
+    -- the current rate. This is a view function and does not alter the ledger state.
+    -- The result indicates the payment from the perspective of the trader:
+    --   - Positive: Trader receives a payment.
+    --   - Negative: Trader owes a payment.
+    nonconsuming choice CalculateFundingPayment : Decimal
+      with
+        positionData : Position.Data
+          -- ^ The position data for which to calculate the payment.
+      controller positionData.trader, protocol
+      do
+        -- Ensure the calculation is for the correct market.
+        assertMsg ("Position market ID '" <> positionData.marketId <>
+                   "' does not match funding rate market ID '" <> marketId <> "'")
+          (positionData.marketId == marketId)
+
+        let
+          notionalValue = positionData.size * positionData.entryPrice
+          payment = case positionData.side of
+            Long -> notionalValue * rateData.longFundingRate
+            Short -> notionalValue * rateData.shortFundingRate
+        return payment
+
+    -- | Archives the current funding rate contract and creates a new one with updated rates
+    -- for the next epoch. This is the primary mechanism for advancing the funding state.
+    choice UpdateFundingRate : ContractId FundingRate
+      with
+        newRateData : FundingRateData
+          -- ^ The new funding rate data for the upcoming epoch.
+      controller protocol
+      do
+        -- Ensure time moves forward to prevent replaying old rates.
+        assertMsg ("New epoch timestamp " <> show newRateData.epochTimestamp <>
+                   " must be after current epoch timestamp " <> show rateData.epochTimestamp)
+          (newRateData.epochTimestamp > rateData.epochTimestamp)
+
+        -- The sum of payments across the system should be zero (ignoring fees).
+        -- This ensures the protocol is not a counterparty to funding.
+        assertMsg "Long and short funding rates must sum to zero."
+          (newRateData.longFundingRate + newRateData.shortFundingRate == 0.0)
+
+        create this with rateData = newRateData
+
+-- | Test script to demonstrate the funding rate lifecycle.
+testFundingRate : Script ()
+testFundingRate = script do
+  protocol <- allocatePartyWithHint "Protocol" (PartyIdHint "protocol-fr")
+  trader <- allocatePartyWithHint "Trader" (PartyIdHint "trader-fr")
+  observer <- allocatePartyWithHint "Observer" (PartyIdHint "observer-fr")
+
+  let
+    marketId = "BTC-USD-PERP"
+    now = time (DA.Date.date 2024 DA.Date.Sep 10) 8 0 0
+
+    initialRateData = FundingRateData
+      with
+        longFundingRate = 0.0001   -- Longs pay
+        shortFundingRate = -0.0001 -- Shorts receive
+        epochTimestamp = now
+
+  -- 1. Create the initial funding rate contract
+  fundingRateCid <- submit protocol do
+    createCmd FundingRate with
+      protocol
+      marketId
+      rateData = initialRateData
+      observers = DA.Set.fromList [observer]
+  debug "Initial FundingRate contract created."
+
+  -- 2. Define a sample position for calculation
+  let
+    position = Position.Data
+      with
+        trader
+        protocol
+        marketId
+        side = Long
+        size = 10.0         -- 10 BTC
+        entryPrice = 65000.0 -- 65,000 USD per BTC
+        margin = 65000.0    -- 65,000 USD margin (10x leverage)
+        entryTimestamp = now
+    notional = position.size * position.entryPrice -- 650,000.0
+
+  -- 3. Calculate payment for a long position
+  longPayment <- submitMulti [trader, protocol] [] do
+    exerciseCmd fundingRateCid (CalculateFundingPayment position)
+
+  let expectedLongPayment = notional * initialRateData.longFundingRate -- 650000 * 0.0001 = 65.0
+  longPayment === expectedLongPayment
+  debug $ "Long position payment calculation correct: " <> show longPayment
+
+  -- 4. Calculate payment for a short position
+  let shortPosition = position with side = Short
+  shortPayment <- submitMulti [trader, protocol] [] do
+    exerciseCmd fundingRateCid (CalculateFundingPayment shortPosition)
+
+  let expectedShortPayment = notional * initialRateData.shortFundingRate -- 650000 * -0.0001 = -65.0
+  shortPayment === expectedShortPayment
+  debug $ "Short position payment calculation correct: " <> show shortPayment
+
+  -- 5. Update the funding rate for the next epoch
+  let
+    nextEpochTime = now `addRelTime` relTime 8 0 0 -- 8 hours later
+    newRateData = FundingRateData
+      with
+        longFundingRate = -0.00005  -- Shorts pay
+        shortFundingRate = 0.00005 -- Longs receive
+        epochTimestamp = nextEpochTime
+
+  newFundingRateCid <- submit protocol do
+    exerciseCmd fundingRateCid (UpdateFundingRate newRateData)
+  debug "FundingRate updated for next epoch."
+
+  -- 6. Verify calculation with the new rate
+  newLongPayment <- submitMulti [trader, protocol] [] do
+    exerciseCmd newFundingRateCid (CalculateFundingPayment position)
+
+  let expectedNewLongPayment = notional * newRateData.longFundingRate -- 650000 * -0.00005 = -32.5
+  newLongPayment === expectedNewLongPayment
+  debug $ "Post-update long position payment calculation correct: " <> show newLongPayment
+
+  -- 7. Test failure case: updating with an older timestamp
+  submitMustFail protocol do
+    exerciseCmd newFundingRateCid (UpdateFundingRate initialRateData)
+  debug "Correctly failed to update with old timestamp."
+
+  -- 8. Test failure case: updating with non-zero sum rates
+  let badRateData = newRateData with longFundingRate = 0.1, shortFundingRate = 0.1
+  submitMustFail protocol do
+    exerciseCmd newFundingRateCid (UpdateFundingRate badRateData with epochTimestamp = nextEpochTime `addRelTime` relTime 1 0 0)
+  debug "Correctly failed to update with non-zero sum rates."
