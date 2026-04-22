@@ -1,0 +1,187 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+
+module Perps.Liquidation where
+
+import Daml.Script
+import DA.Action (when)
+import DA.Assert ((===))
+import DA.Math (round)
+import Perps.Position (Data(..), Direction(..))
+import Perps.MarkPrice (OraclePrice(..))
+
+-- | Internal helper function to calculate the unrealized Profit and Loss (PnL) of a position.
+-- PnL is calculated based on the position's direction, size, entry price, and the current mark price.
+calculatePnl: Direction -> Decimal -> Decimal -> Decimal -> Decimal
+calculatePnl direction size entryPrice markPrice =
+  case direction of
+    Long -> size * (markPrice - entryPrice)
+    Short -> size * (entryPrice - markPrice)
+
+-- | A record of a position having been liquidated.
+-- This contract is created upon successful liquidation to serve as an immutable historical record.
+-- It is observable by both the protocol and the trader, ensuring transparency of the event.
+template LiquidationEvent
+  with
+    protocol: Party
+      -- ^ The protocol operator party.
+    trader: Party
+      -- ^ The party whose position was liquidated.
+    liquidatedPosition: Data
+      -- ^ A snapshot of the position data at the moment of liquidation.
+    liquidationPrice: Decimal
+      -- ^ The mark price at which the liquidation was executed.
+    lostCollateral: Decimal
+      -- ^ The amount of collateral forfeited by the trader.
+  where
+    signatory protocol
+    observer trader
+
+-- | Represents a position that is subject to liquidation monitoring.
+-- This contract is created by the protocol for each active position and contains the logic
+-- to check if the position's margin has fallen below the maintenance requirement.
+template Liquidatable
+  with
+    protocol: Party
+      -- ^ The protocol operator party, who acts as the liquidator.
+    trader: Party
+      -- ^ The owner of the position being monitored.
+    positionCid: ContractId Data
+      -- ^ The contract ID of the position under liquidation watch.
+    maintenanceMarginRatio: Decimal
+      -- ^ The maintenance margin requirement as a fraction of notional value (e.g., 0.05 for 5%).
+  where
+    signatory protocol
+    observer trader
+
+    key (protocol, trader, positionCid) : (Party, Party, ContractId Data)
+    maintainer key._1
+
+    -- | A choice exercised by the protocol to check a position against the current mark price
+    -- and liquidate it if it is under-collateralized.
+    choice CheckAndLiquidate : ContractId LiquidationEvent
+      with
+        markPriceCid: ContractId OraclePrice
+          -- ^ The contract ID of the current oracle price used for valuation.
+      controller protocol
+      do
+        position <- fetch positionCid
+        markPrice <- fetch markPriceCid
+        debug $ "Checking liquidation for trader " <> show trader <> " at price " <> show markPrice.price
+
+        -- Ensure the provided oracle price is for the correct instrument.
+        assertMsg "Oracle price instrument does not match position instrument"
+          (position.instrument == markPrice.instrument)
+
+        -- Calculate the position's current financial state.
+        let pnl = calculatePnl position.direction position.size position.entryPrice markPrice.price
+        let currentMargin = position.collateral + pnl
+        let notionalValue = position.size * markPrice.price
+        let requiredMaintenanceMargin = notionalValue * maintenanceMarginRatio
+
+        debug $
+          [ "PnL: " <> show pnl
+          , "Current Margin: " <> show currentMargin
+          , "Notional Value: " <> show notionalValue
+          , "Required Maintenance Margin: " <> show requiredMaintenanceMargin
+          ]
+
+        -- The core liquidation condition. If this assertion fails, the transaction is aborted
+        -- and the position remains active.
+        assertMsg "Position is not below maintenance margin" (currentMargin < requiredMaintenanceMargin)
+
+        -- If the assertion passes, proceed with liquidation.
+        debug $ "Liquidating position for trader " <> show trader
+
+        -- Archive the active position and this liquidation monitor contract.
+        archive positionCid
+
+        -- Create a historical record of the liquidation event.
+        -- The trader's collateral is transferred to the protocol's insurance fund (implicitly, by not returning it).
+        create LiquidationEvent with
+          protocol
+          trader
+          liquidatedPosition = position
+          liquidationPrice = markPrice.price
+          lostCollateral = position.collateral
+
+-- | A script to test the liquidation workflow.
+-- 1. Sets up a protocol, a trader, and a mark price.
+-- 2. Creates a position that is deliberately underwater.
+-- 3. Creates a `Liquidatable` contract to monitor the position.
+-- 4. Asserts that the position *can* be liquidated based on off-ledger calculations.
+-- 5. Exercises the `CheckAndLiquidate` choice to perform the liquidation.
+-- 6. Verifies that the original position contract is archived and a `LiquidationEvent` is created.
+testLiquidation : Script ()
+testLiquidation = script do
+  protocol <- allocatePartyWithHint "Protocol" (PartyIdHint "protocol")
+  trader <- allocatePartyWithHint "Trader" (PartyIdHint "trader")
+
+  -- Setup: Create mark price and an underwater position
+  let instrument = "BTC-USD"
+  let liquidationPrice = 20000.0
+  markPriceCid <- submit protocol do
+    create OraclePrice with
+      provider = protocol
+      observers = [trader]
+      instrument
+      price = liquidationPrice
+      lastUpdateTime = getTime
+
+  let
+    entryPrice = 22000.0
+    collateral = 1000.0
+    leverage = 10.0
+    notionalValueAtEntry = collateral * leverage
+    -- size = 10000 / 22000 = 0.4545454545
+    size = round 10 (notionalValueAtEntry / entryPrice)
+
+  positionCid <- submit protocol do
+    create Data with
+      protocol
+      trader
+      instrument
+      direction = Long
+      size
+      collateral
+      entryPrice
+      leverage
+
+  let maintenanceMarginRatio = 0.05 -- 5%
+  liquidatableCid <- submit protocol do
+    create Liquidatable with
+      protocol
+      trader
+      positionCid
+      maintenanceMarginRatio
+
+  -- Pre-liquidation calculation for assertion
+  let pnl = calculatePnl Long size entryPrice liquidationPrice -- (20000 - 22000) * size = -909.09
+  let currentMargin = collateral + pnl -- 1000 - 909.09 = 90.91
+  let notionalValue = size * liquidationPrice -- 0.4545.. * 20000 = 9090.90
+  let requiredMaintenanceMargin = notionalValue * maintenanceMarginRatio -- 9090.90 * 0.05 = 454.54
+  assert (currentMargin < requiredMaintenanceMargin)
+
+  -- Execute liquidation
+  eventCid <- submit protocol do
+    exercise liquidatableCid CheckAndLiquidate with markPriceCid
+
+  -- Verify outcome
+  -- Both position and liquidatable contracts should be archived.
+  (submitMustFail protocol do fetch positionCid)
+  (submitMustFail trader do fetch positionCid)
+  (submitMustFail protocol do fetch liquidatableCid)
+
+  -- The liquidation event should exist and be visible to both parties.
+  event <- submit protocol do fetch eventCid
+  event' <- submit trader do fetch eventCid
+  event === event'
+  event.lostCollateral === collateral
+  event.liquidationPrice === liquidationPrice
+  event.trader === trader
+  event.liquidatedPosition.size === size
+
+  debug "Liquidation test successful."
+  return ()
