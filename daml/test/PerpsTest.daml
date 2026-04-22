@@ -1,0 +1,246 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module PerpsTest where
+
+import Daml.Script
+import DA.Assert
+import DA.Date qualified as Date
+import DA.Time qualified as Time
+import DA.Decimal (abs)
+
+import Perps.MarkPrice
+import Perps.FundingRate
+import Perps.InsuranceFund
+import Perps.MarginVault
+import Perps.Position
+import Perps.Liquidation (Reward)
+
+-- | Sets up the common infrastructure for the perp protocol tests.
+-- Returns the parties, core contract IDs, and the initial time.
+setup = do
+  protocol <- allocatePartyWithHint "Protocol" (PartyIdHint "protocol")
+  oracleParty <- allocatePartyWithHint "Oracle" (PartyIdHint "oracle")
+  trader1 <- allocatePartyWithHint "Trader1" (PartyIdHint "trader1")
+  liquidator <- allocatePartyWithHint "Liquidator" (PartyIdHint "liquidator")
+
+  let now = Time.time (Date.date 2024 Sep 10) 10 0 0
+  let initialPrice = 3000.0 -- e.g., ETH price
+  let initialFundingRate = 0.0001 -- 0.01%
+
+  -- Create the Oracle and set the initial price
+  oracleCid <- submit protocol do createCmd Oracle with owner = oracleParty, operator = protocol
+  priceCid <- submit oracleParty do
+    exerciseCmd oracleCid UpdatePrice with
+      newPrice = initialPrice
+      lastUpdatedAt = now
+
+  -- Create the Funding Rate state
+  fundingStateCid <- submit protocol do
+    createCmd FundingRate.State with
+      operator = protocol
+      rate = initialFundingRate
+      lastAccrued = now
+
+  -- Create the Insurance Fund
+  insuranceFundCid <- submit protocol do
+    createCmd InsuranceFund.Fund with
+      operator = protocol
+      balance = 0.0
+
+  -- Trader creates their own margin vault
+  vaultCid <- submit trader1 do
+    createCmd MarginVault.Vault with
+      owner = trader1
+      operator = protocol
+      balance = 0.0
+
+  return (protocol, oracleParty, trader1, liquidator, oracleCid, priceCid, fundingStateCid, insuranceFundCid, vaultCid, now)
+
+-- | Main test suite for the perpetuals protocol.
+perpsTests = script do
+
+  test "Full position lifecycle: open, fund, and close" do
+    (protocol, oracleParty, trader, _, oracleCid, priceCid, fundingStateCid, _, vaultCid, now) <- setup
+
+    -- 1. Trader deposits margin into their vault
+    let depositAmount = 5000.0
+    vaultAfterDepositCid <- submit trader do exerciseCmd vaultCid Deposit with amount = depositAmount
+    vaultAfterDeposit <- fetch vaultAfterDepositCid
+    vaultAfterDeposit.balance === depositAmount
+
+    -- 2. Trader opens a 10x leveraged long position of size 2.0
+    let positionSize = 2.0
+    let leverage = 10.0
+    let entryPrice = 3000.0
+    let notionalValue = entryPrice * positionSize -- 6000.0
+    let marginRequired = notionalValue / leverage -- 600.0
+
+    (positionCid, vaultAfterOpenCid) <- submit trader do
+      exerciseCmd vaultAfterDepositCid OpenPosition with
+        size = positionSize
+        leverage = leverage
+        side = Long
+        priceCid = priceCid
+        fundingStateCid = fundingStateCid
+        liquidators = [] -- Permissionless liquidation
+
+    -- Verify position state
+    pos <- fetch positionCid
+    pos.owner === trader
+    pos.protocol === protocol
+    pos.size === positionSize
+    pos.leverage === leverage
+    pos.side === Long
+    pos.entryPrice === entryPrice
+    pos.margin === marginRequired
+
+    -- Verify vault balance decreased by the margin used
+    vaultAfterOpen <- fetch vaultAfterOpenCid
+    vaultAfterOpen.balance === (depositAmount - marginRequired) -- 5000.0 - 600.0 = 4400.0
+
+    -- 3. Price moves in the trader's favor
+    let favorablePrice = 3200.0
+    let time1 = Time.addRelTime now (Time.hours 1)
+    favorablePriceCid <- submit oracleParty do
+      exerciseCmd oracleCid UpdatePrice with newPrice = favorablePrice, lastUpdatedAt = time1
+
+    -- 4. Trader adds more margin to the position
+    let additionalMargin = 100.0
+    (posAfterAddMarginCid, vaultAfterAddMarginCid) <- submit trader do
+      exerciseCmd positionCid AddMargin with
+        vaultCid = vaultAfterOpenCid
+        amount = additionalMargin
+
+    posAfterAddMargin <- fetch posAfterAddMarginCid
+    posAfterAddMargin.margin === marginRequired + additionalMargin -- 600.0 + 100.0 = 700.0
+
+    vaultAfterAddMargin <- fetch vaultAfterAddMarginCid
+    vaultAfterAddMargin.balance === (depositAmount - marginRequired - additionalMargin) -- 4400.0 - 100.0 = 4300.0
+
+    -- 5. Trader closes the position to realize PnL
+    (finalVaultCid, pnl) <- submit trader do
+      exerciseCmd posAfterAddMarginCid ClosePosition with priceCid = favorablePriceCid
+
+    -- Verify PnL calculation: (Exit Price - Entry Price) * Size for a long
+    let expectedPnl = (favorablePrice - entryPrice) * positionSize -- (3200.0 - 3000.0) * 2.0 = 400.0
+    pnl === expectedPnl
+
+    -- Verify final vault balance: Previous Balance + Total Margin Returned + PnL
+    let totalMarginInPos = marginRequired + additionalMargin -- 700.0
+    let expectedFinalBalance = vaultAfterAddMargin.balance + totalMarginInPos + expectedPnl -- 4300.0 + 700.0 + 400.0 = 5400.0
+    finalVault <- fetch finalVaultCid
+    finalVault.balance === expectedFinalBalance
+
+    -- Verify the Position contract has been archived
+    query @Position trader >>= \contracts -> contracts === []
+
+  test "Liquidation of an underwater short position" do
+    (protocol, oracleParty, trader, liquidator, oracleCid, priceCid, fundingStateCid, insuranceFundCid, vaultCid, now) <- setup
+
+    -- 1. Deposit and open a leveraged short position
+    let initialMargin = 300.0
+    vaultAfterDepositCid <- submit trader do exerciseCmd vaultCid Deposit with amount = initialMargin
+    (positionCid, _) <- submit trader do
+      exerciseCmd vaultAfterDepositCid OpenPosition with
+        size = 1.0
+        leverage = 10.0
+        side = Short
+        priceCid = priceCid
+        fundingStateCid = fundingStateCid
+        liquidators = [liquidator]
+
+    -- 2. Calculate liquidation price
+    -- Notional = 3000.0 * 1.0 = 3000.0. Margin = 300.0 (10%).
+    -- Assuming Maintenance Margin Rate (MMR) is 5%. Maint. Margin = 3000.0 * 0.05 = 150.0
+    -- Loss that triggers liquidation = Margin - Maint. Margin = 300.0 - 150.0 = 150.0
+    -- For a short, price must *rise* by this amount. Liq Price = Entry + Loss/Size = 3000.0 + 150.0/1.0 = 3150.0
+
+    -- 3. Price moves against the trader, past the liquidation price
+    let adversePrice = 3160.0
+    let time1 = Time.addRelTime now (Time.hours 1)
+    adversePriceCid <- submit oracleParty do
+      exerciseCmd oracleCid UpdatePrice with newPrice = adversePrice, lastUpdatedAt = time1
+
+    -- 4. Liquidator steps in and exercises the non-consuming choice
+    (rewardCid, updatedInsuranceFundCid) <- submit liquidator do
+      exerciseCmd positionCid CheckLiquidation with
+        priceCid = adversePriceCid
+        insuranceFundCid = insuranceFundCid
+
+    -- 5. Verify outcomes
+    -- The position contract should be archived and gone from the ACS
+    query @Position trader >>= \contracts -> contracts === []
+
+    -- Calculate PnL and what's left for fees/insurance
+    -- Loss = (Exit Price - Entry Price) * Size = (3160.0 - 3000.0) * 1.0 = 160.0
+    -- Margin remaining = Initial Margin - Loss = 300.0 - 160.0 = 140.0
+    -- Assuming a fixed liquidation fee of 10.0 paid to liquidator
+    let liquidatorFee = 10.0
+    -- Remainder is transferred to the insurance fund
+    let remainderToFund = 140.0 - liquidatorFee -- 130.0
+
+    -- Check insurance fund balance
+    updatedInsuranceFund <- fetch updatedInsuranceFundCid
+    updatedInsuranceFund.balance === remainderToFund
+
+    -- Check liquidator reward contract
+    reward <- queryContractId liquidator rewardCid
+    reward.owner === liquidator
+    reward.amount === liquidatorFee
+
+    -- Trader's vault should be empty as all initial margin was used for the position
+    Some vault <- queryContractId trader (coerceContractId vaultCid)
+    vault.balance === 0.0
+
+  test "Funding accrual affects position margin for long and short" do
+    (protocol, _, trader, _, _, priceCid, fundingStateCid, _, vaultCid, now) <- setup
+
+    -- 1. Open a long position
+    vaultLongDepositCid <- submit trader do exerciseCmd vaultCid Deposit with amount = 300.0
+    (longPosCid, _) <- submit trader do
+      exerciseCmd vaultLongDepositCid OpenPosition with
+        size = 1.0, leverage = 10.0, side = Long, priceCid = priceCid, fundingStateCid = fundingStateCid, liquidators = []
+
+    posBeforeFunding <- fetch longPosCid
+    posBeforeFunding.margin === 300.0
+
+    -- 2. Time passes and protocol operator accrues funding
+    let time1 = Time.addRelTime now (Time.hours 8)
+    updatedFundingStateCid <- submit protocol do
+      exerciseCmd fundingStateCid AccrueFunding with
+        newRate = -0.00005 -- New rate for the next period, can be negative
+        timestamp = time1
+
+    -- 3. Apply funding to the long position
+    longPosAfterFundingCid <- submit trader do
+      exerciseCmd longPosCid ApplyFunding with fundingStateCid = updatedFundingStateCid
+
+    -- 4. Verify margin change for the long position
+    -- Funding payment = Notional * Funding Rate for the period
+    -- Notional = Entry Price * Size = 3000.0 * 1.0 = 3000.0
+    -- Funding Rate (from initial state) = 0.0001
+    -- Payment = 3000.0 * 0.0001 = 0.3
+    -- Since trader is LONG and rate is POSITIVE, trader PAYS. Margin decreases.
+    let fundingPayment = 0.3
+    let expectedLongMargin = 300.0 - fundingPayment
+    longPosAfterFunding <- fetch longPosAfterFundingCid
+    assert (abs (longPosAfterFunding.margin - expectedLongMargin) < 0.000001)
+
+    -- 5. Now test a short position with the same funding accrual
+    trader2 <- allocatePartyWithHint "Trader2" (PartyIdHint "trader2")
+    vault2Cid <- submit trader2 do createCmd Vault with owner = trader2, operator = protocol, balance = 0.0
+    vault2DepositCid <- submit trader2 do exerciseCmd vault2Cid Deposit with amount = 300.0
+    (shortPosCid, _) <- submit trader2 do
+      exerciseCmd vault2DepositCid OpenPosition with
+        size = 1.0, leverage = 10.0, side = Short, priceCid = priceCid, fundingStateCid = fundingStateCid, liquidators = []
+
+    -- Apply the same accrued funding state to the short position
+    shortPosAfterFundingCid <- submit trader2 do
+      exerciseCmd shortPosCid ApplyFunding with fundingStateCid = updatedFundingStateCid
+
+    -- 6. Verify margin change for the short position
+    -- Short position RECEIVES funding when rate is positive. Margin increases.
+    let expectedShortMargin = 300.0 + fundingPayment
+    shortPosAfterFunding <- fetch shortPosAfterFundingCid
+    assert (abs (shortPosAfterFunding.margin - expectedShortMargin) < 0.000001)
