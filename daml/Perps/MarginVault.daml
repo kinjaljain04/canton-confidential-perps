@@ -1,0 +1,145 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Perps.MarginVault where
+
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Set (Set)
+import DA.Set qualified as Set
+import DA.Optional (fromSome)
+
+-- | Represents the central collateral vault for the perpetuals protocol.
+-- This contract holds the total collateral for all traders and tracks individual
+-- balances. It serves as the single source of truth for margin deposits and
+-- withdrawals, and for settling PnL.
+template MarginVault
+  with
+    protocol: Party
+      -- ^ The operator of the perpetuals exchange.
+    asset: Text
+      -- ^ The identifier for the collateral asset (e.g., "USDC").
+    totalCollateral: Decimal
+      -- ^ The total amount of collateral held in the vault across all traders.
+    traderBalances: Map Party Decimal
+      -- ^ A map from each trader's party to their individual collateral balance.
+    observers: Set Party
+      -- ^ The set of parties who can observe the vault's state. Includes the
+      -- protocol and all traders who have a balance.
+  where
+    signatory protocol
+    observer Set.toList observers
+
+    ensure
+      -- The total collateral must equal the sum of all individual trader balances.
+      totalCollateral == sum (Map.values traderBalances)
+      -- The protocol must always be an observer.
+      && Set.member protocol observers
+      -- All parties with a non-zero balance must be observers.
+      && Map.keysSet traderBalances `Set.isSubsetOf` observers
+
+    key (protocol, asset) : (Party, Text)
+    maintainer key._1
+
+    -- | A choice for a trader to deposit collateral into the vault.
+    -- This is typically orchestrated by the protocol after verifying an
+    -- off-ledger or on-ledger token transfer.
+    choice DepositMargin : ContractId MarginVault
+      with
+        trader: Party
+          -- ^ The party depositing the margin.
+        amount: Decimal
+          -- ^ The amount of collateral to deposit.
+      controller protocol
+      do
+        ensure amount > 0.0
+          "Deposit amount must be positive."
+
+        let currentBalance = Map.findWithDefault 0.0 trader traderBalances
+        let newTraderBalance = currentBalance + amount
+        let newTraderBalances = Map.insert trader newTraderBalance traderBalances
+        let newTotalCollateral = totalCollateral + amount
+
+        -- Add the trader as an observer if they are not already one.
+        let newObservers = Set.insert trader observers
+
+        create this with
+          traderBalances = newTraderBalances
+          totalCollateral = newTotalCollateral
+          observers = newObservers
+
+    -- | A choice for a trader to withdraw collateral from the vault.
+    -- The controller (protocol) is responsible for ensuring the trader has
+    -- sufficient available margin (i.e., not locked in open positions)
+    -- before executing this withdrawal.
+    choice WithdrawMargin : ContractId MarginVault
+      with
+        trader: Party
+          -- ^ The party withdrawing the margin.
+        amount: Decimal
+          -- ^ The amount of collateral to withdraw.
+      controller protocol
+      do
+        ensure amount > 0.0
+          "Withdrawal amount must be positive."
+
+        let currentBalance = case Map.lookup trader traderBalances of
+              Some b -> b
+              None -> error $ "Cannot withdraw: Trader " <> show trader <> " has no balance in the vault."
+
+        ensure currentBalance >= amount
+          $ "Withdrawal amount of " <> show amount <> " exceeds trader's balance of " <> show currentBalance
+
+        let newTraderBalance = currentBalance - amount
+        let newTotalCollateral = totalCollateral - amount
+
+        -- If the trader's balance becomes zero, remove them from the balances map
+        -- and the observer set to keep the state clean.
+        let (newTraderBalances, newObservers) =
+              if newTraderBalance == 0.0 then
+                (Map.delete trader traderBalances, Set.delete trader observers)
+              else
+                (Map.insert trader newTraderBalance traderBalances, observers)
+
+        create this with
+          traderBalances = newTraderBalances
+          totalCollateral = newTotalCollateral
+          observers = newObservers
+
+    -- | A choice for the protocol to adjust a trader's balance.
+    -- This is used to settle realized PnL from closed positions, apply funding
+    -- payments, or deduct liquidation penalties.
+    choice AdjustBalance : ContractId MarginVault
+      with
+        trader: Party
+          -- ^ The trader whose balance is being adjusted.
+        delta: Decimal
+          -- ^ The change in the trader's balance. Can be positive (profit)
+          -- or negative (loss/fee).
+      controller protocol
+      do
+        let currentBalance = case Map.lookup trader traderBalances of
+              Some b -> b
+              None -> error $ "Cannot adjust balance: Trader " <> show trader <> " does not exist in the vault."
+
+        let newBalance = currentBalance + delta
+
+        ensure newBalance >= 0.0
+          "Adjustment results in a negative balance for the trader. This indicates a protocol shortfall."
+
+        let newTotalCollateral = totalCollateral + delta
+        let newTraderBalances = Map.insert trader newBalance traderBalances
+
+        create this with
+          traderBalances = newTraderBalances
+          totalCollateral = newTotalCollateral
+
+    -- | A non-consuming choice to query a specific trader's balance.
+    -- Useful for UIs and other components to check available margin.
+    nonconsuming choice GetTraderBalance : Decimal
+      with
+        trader: Party
+          -- ^ The party whose balance is being queried.
+      controller trader, protocol
+      do
+        return $ Map.findWithDefault 0.0 trader traderBalances
