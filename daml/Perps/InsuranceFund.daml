@@ -1,0 +1,197 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Perps.InsuranceFund where
+
+import Daml.Script
+
+import DA.Set (Set)
+import DA.Set qualified as Set
+
+import Daml.Finance.Interface.Types.Common.Types (InstrumentKey)
+import Daml.Finance.Interface.Account.Base qualified as Account (I)
+import Daml.Finance.Interface.Holding.Base qualified as Holding (I, Base, credit, debit)
+import Daml.Finance.Interface.Holding.Factory qualified as Holding (Factory)
+import Daml.Finance.Interface.Account.Factory qualified as Account (Factory)
+import Daml.Finance.Interface.Account.Account qualified as Account (Id(..))
+
+-- | Defines the data and choices for the protocol's insurance fund.
+-- This fund serves as a backstop to cover losses from liquidations where a position's
+-- collateral is insufficient to cover the debt (i.e., bad debt). It can be capitalized
+-- through surplus from profitable liquidations or direct deposits.
+template InsuranceFund
+  with
+    operator: Party
+      -- ^ The party managing the fund, typically the protocol operator.
+    id: Text
+      -- ^ A unique identifier for this insurance fund instance.
+    collateralInstrument: InstrumentKey
+      -- ^ The instrument used for collateral and settlement within the fund.
+    holdingCid: ContractId Holding.Base
+      -- ^ The contract holding the fund's assets.
+    observers: Set Party
+      -- ^ Parties who can observe the fund's state.
+  where
+    signatory operator
+    observer observers
+
+    key (operator, id) : (Party, Text)
+    maintainer key._1
+
+    -- | A view of the insurance fund's current state.
+    data View = View
+      with
+        operator: Party
+        id: Text
+        collateralInstrument: InstrumentKey
+        holdingCid: ContractId Holding.Base
+        observers: Set Party
+      deriving (Eq, Show)
+
+    nonconsuming choice GetView : View
+      -- ^ Retrieves the current state of the insurance fund.
+      controller operator, (Set.toList observers)
+      do
+        pure View with ..
+
+    -- | Covers a shortfall from a liquidation where the collateral was insufficient.
+    -- The fund debits its own holdings to make the protocol whole.
+    choice CoverShortfall: ContractId InsuranceFund
+      with
+        shortfallAmount: Decimal
+          -- ^ The amount of bad debt to cover.
+        recipientAccountCid: ContractId Account.I
+          -- ^ The account to receive the funds (e.g., the clearing house or margin vault).
+      controller operator
+        -- ^ Only the protocol operator can authorize covering a shortfall.
+      do
+        assertMsg "Shortfall amount must be positive." (shortfallAmount > 0.0)
+
+        -- Debit the insurance fund's holding to cover the loss
+        (updatedHoldingCid, _) <- exercise holdingCid Holding.Debit with
+          actors = Set.singleton operator
+          targetAccount = recipientAccountCid
+          amount = shortfallAmount
+
+        -- Recreate the fund with the updated holding
+        create this with holdingCid = updatedHoldingCid
+
+    -- | Receives surplus collateral from a profitable liquidation.
+    -- This choice credits the fund's holding, increasing its balance.
+    choice ReceiveLiquidationSurplus: ContractId InsuranceFund
+      with
+        surplusHoldingCid: ContractId Holding.I
+          -- ^ The holding containing the surplus collateral from the liquidated position.
+      controller operator
+        -- ^ Only the operator (via the liquidation engine) can direct surplus to the fund.
+      do
+        -- Credit the insurance fund's holding with the surplus amount
+        (updatedHoldingCid, _) <- exercise holdingCid Holding.Credit with
+          actors = Set.singleton operator
+          sourceHolding = surplusHoldingCid
+
+        -- Recreate the fund with the updated holding
+        create this with holdingCid = updatedHoldingCid
+
+    -- | Allows any party to deposit capital into the insurance fund.
+    choice AddCapital: ContractId InsuranceFund
+      with
+        depositor: Party
+          -- ^ The party making the deposit.
+        depositHoldingCid: ContractId Holding.I
+          -- ^ The depositor's holding to be transferred to the fund.
+      controller depositor
+      do
+        (updatedHoldingCid, _) <- exercise holdingCid Holding.Credit with
+          actors = Set.singleton depositor
+          sourceHolding = depositHoldingCid
+
+        create this with holdingCid = updatedHoldingCid
+
+    -- | Allows the operator to withdraw capital from the fund.
+    -- This is a privileged action for operational needs or distributing protocol revenue.
+    choice WithdrawCapital: ContractId InsuranceFund
+      with
+        amount: Decimal
+          -- ^ The amount to withdraw.
+        recipientAccountCid: ContractId Account.I
+          -- ^ The account that will receive the withdrawn funds.
+      controller operator
+      do
+        assertMsg "Withdrawal amount must be positive." (amount > 0.0)
+
+        (updatedHoldingCid, _) <- exercise holdingCid Holding.Debit with
+          actors = Set.singleton operator
+          targetAccount = recipientAccountCid
+          amount = amount
+
+        create this with holdingCid = updatedHoldingCid
+
+    -- | Archives the insurance fund contract.
+    choice ArchiveFund: ()
+      controller operator
+      do pure ()
+
+-- | A script to set up and initialize an InsuranceFund on the ledger.
+-- This demonstrates the creation of the necessary accounts and holdings.
+setup: Script (ContractId InsuranceFund)
+setup = script do
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "operator")
+  observer <- allocatePartyWithHint "Observer" (PartyIdHint "observer")
+
+  -- In a real deployment, these factory CIDs would be discovered from the ledger.
+  accountFactoryCid <- submit operator do createCmd Account.Factory with provider = operator; observers = Set.empty
+  holdingFactoryCid <- submit operator do createCmd Holding.Factory with provider = operator; observers = Set.empty
+
+  let
+    usdcInstrument = InstrumentKey with
+      issuer = operator
+      depository = operator
+      id = "USDC"
+      version = "0"
+    fundAccountId = Account.Id with signatories = Set.singleton operator, label = "PerpsInsuranceFundAccount_V1"
+
+  -- Create an account for the insurance fund
+  (fundAccountCid, _) <- exercise accountFactoryCid Account.Create with
+    instrument = usdcInstrument
+    id = fundAccountId
+    observers = Set.singleton observer
+
+  -- Create an initial empty holding for the fund
+  emptyHoldingCid <- exercise holdingFactoryCid Holding.Create with
+    instrument = usdcInstrument
+    accountCid = fundAccountCid
+    amount = 0.0
+
+  -- Create the InsuranceFund contract
+  fundCid <- submit operator do
+    createCmd InsuranceFund with
+      operator
+      id = "PERPS_MAIN_FUND_V1"
+      collateralInstrument = usdcInstrument
+      holdingCid = emptyHoldingCid
+      observers = Set.singleton observer
+
+  -- Example: Add some initial capital
+  depositor <- allocatePartyWithHint "Depositor" (PartyIdHint "depositor")
+  let
+    depositorAccountId = Account.Id with signatories = Set.singleton depositor, label = "InitialDepositorAccount"
+
+  (depositorAccountCid, _) <- exercise accountFactoryCid Account.Create with
+    instrument = usdcInstrument
+    id = depositorAccountId
+    observers = Set.empty
+
+  initialDepositCid <- exercise holdingFactoryCid Holding.Create with
+    instrument = usdcInstrument
+    accountCid = depositorAccountCid
+    amount = 1_000_000.0
+
+  -- Depositor adds capital to the fund
+  updatedFundCid <- submit depositor do
+    exerciseCmd fundCid AddCapital with
+      depositor
+      depositHoldingCid = initialDepositCid
+
+  -- Return the CID of the capitalized fund
+  pure updatedFundCid
