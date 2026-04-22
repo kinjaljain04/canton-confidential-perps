@@ -1,204 +1,268 @@
 -- |
--- Copyright (c) 2024, Digital Asset (Switzerland) GmbH and/or its affiliates.
--- All rights reserved.
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
 --
 
 module Perps.Position where
 
-import Daml.Script
+import Daml.Finance.Interface.Types.Common.Types (InstrumentKey)
+import DA.Assert
+import DA.Optional (isSome, fromSome)
 import DA.Time (Time)
-import DA.Assert ((===))
+import DA.Text (Text, show)
 
--- | Defines the side of a trade, either Long or Short.
+import Perps.MarginVault (MarginVault)
+import Perps.Liquidation (calculateLiquidationPrice, MaintenanceMargin(..))
+
+-- | The direction of a trade.
 data Side = Long | Short
   deriving (Eq, Show, Ord)
 
--- | A data record to return a snapshot of a position's current state and health.
--- This is used as a return type for view choices to provide calculated, off-ledger
--- information without altering the contract itself.
+-- | Determines how margin is calculated for a position.
+-- Cross: Margin is shared across all positions using the same collateral.
+-- Isolated: Margin is specific to a single position, and losses are capped at this amount.
+data MarginMode = Cross | Isolated
+  deriving (Eq, Show, Ord)
+
+-- | Unique key for a position contract.
+type PositionKey = (Party, Party, InstrumentKey, Side)
+
+-- | A view of the position, used for display or consumption by other contracts
+-- that do not need to see the full position details or have control.
 data PositionView = PositionView
   with
-    operator: Party
-    trader: Party
-    marketId: Text
-    side: Side
-    size: Decimal              -- ^ The size of the position in the base asset.
-    collateral: Decimal          -- ^ The base collateral deposited by the trader.
-    entryPrice: Decimal
-    markPrice: Decimal           -- ^ The mark price used for this calculation.
-    pnl: Decimal                 -- ^ Calculated Profit and Loss.
-    fundingAccrued: Decimal
-    effectiveCollateral: Decimal -- ^ Base collateral + accrued funding.
-    marginValue: Decimal         -- ^ Effective collateral + P&L.
-    notionalValue: Decimal       -- ^ Current notional value (size * markPrice).
-    marginRatio: Decimal         -- ^ The ratio of margin value to notional value.
-    liquidationPrice: Decimal    -- ^ The calculated price at which the position would be liquidated.
+    operator : Party
+    trader : Party
+    instrument : InstrumentKey
+    side : Side
+    marginMode : MarginMode
+    size : Decimal
+    entryPrice : Decimal
+    entryValue : Decimal
+    liquidationPrice : Decimal
   deriving (Eq, Show)
 
--- | Represents a trader's open perpetuals position in a specific market.
--- The contract is confidential, visible only to the `trader` and the protocol `operator`.
--- This privacy ensures that position details like size, entry price, and liquidation
--- price are not exposed to the public, preventing front-running and targeted liquidations.
+-- | Represents a trader's open perpetuals position.
+-- This contract is private between the trader and the protocol operator, ensuring
+-- confidentiality of position details like size, entry price, and liquidation price.
 template Position
   with
-    operator: Party             -- ^ The protocol operator.
-    trader: Party               -- ^ The party holding the position.
-    marketId: Text              -- ^ Identifier for the market, e.g., "ETH-USD".
-    side: Side                  -- ^ The direction of the position: Long or Short.
-    size: Decimal               -- ^ Position size in base asset terms (e.g., amount of ETH). Must be positive.
-    collateral: Decimal         -- ^ Collateral deposited in quote asset terms (e.g., amount of USD). Must be positive.
-    entryPrice: Decimal         -- ^ The average entry price of the position. Must be positive.
-    fundingAccrued: Decimal     -- ^ Net funding paid (negative) or received (positive) over the life of the position.
-    lastFundingTimestamp: Time  -- ^ The timestamp of the last funding update.
+    operator : Party
+      -- ^ The protocol operator.
+    trader : Party
+      -- ^ The owner of the position.
+    instrument : InstrumentKey
+      -- ^ The perpetual instrument being traded.
+    marginVaultCid : ContractId MarginVault
+      -- ^ The contract ID of the vault holding the collateral.
+    side : Side
+      -- ^ The direction of the position (Long or Short).
+    marginMode : MarginMode
+      -- ^ The margin mode for this position (Cross or Isolated).
+    size : Decimal
+      -- ^ The size of the position in terms of the base asset. Always positive.
+    entryPrice : Decimal
+      -- ^ The average entry price of the position.
+    entryValue : Decimal
+      -- ^ The total notional value at entry (size * entryPrice). Cached for clarity.
+    isolatedMargin : Decimal
+      -- ^ The amount of margin allocated specifically to this position.
+      -- ^ Only used when marginMode is Isolated. Should be 0.0 for Cross margin.
+    collateralValue : Decimal
+      -- ^ The value of the collateral backing this position at the time of last update.
+      -- ^ For Isolated mode, this is `isolatedMargin`. For Cross mode, this is the total vault balance.
+    liquidationPrice : Decimal
+      -- ^ The mark price at which this position will be liquidated.
+    lastFundingTimestamp : Time
+      -- ^ The timestamp of the last funding rate application.
+    fundingAccrued: Decimal
+      -- ^ Net funding paid or received by the position. Positive means received by trader.
+    protocolFee: Decimal
+      -- ^ Fees accrued by this position owed to the protocol.
   where
     signatory operator, trader
 
-    ensure
-      size > 0.0 &&
-      collateral > 0.0 &&
-      entryPrice > 0.0
-
-    -- A key is defined to ensure a trader can only have one position per market per side.
-    -- This simplifies position management and prevents fragmented positions.
-    -- The operator is the maintainer, as they are the central authority for the protocol.
-    key (operator, trader, marketId, side) : (Party, Party, Text, Side)
+    key (operator, trader, instrument, side) : PositionKey
     maintainer key._1
 
-    -- Calculates the Profit and Loss (P&L) for the position given a current mark price.
-    let calculatePnl markPrice =
-          case side of
-            Long  -> size * (markPrice - entryPrice)
-            Short -> size * (entryPrice - markPrice)
+    ensure
+      size > 0.0 &&
+      entryPrice > 0.0 &&
+      entryValue > 0.0 &&
+      liquidationPrice > 0.0 &&
+      (marginMode == Isolated ==> isolatedMargin > 0.0 && collateralValue == isolatedMargin) &&
+      (marginMode == Cross ==> isolatedMargin == 0.0 && collateralValue >= 0.0)
 
-    -- Calculates the price at which the position becomes eligible for liquidation.
-    let calculateLiquidationPrice' totalCollateral maintenanceMarginRate =
-          -- Ensure maintenance margin rate is a valid percentage.
-          assert (maintenanceMarginRate > 0.0 && maintenanceMarginRate < 1.0)
-          let
-            -- For Long: liqPrice = (size * entryPrice - totalCollateral) / (size * (1 - mmRate))
-            calcLong = (size * entryPrice - totalCollateral) / (size * (1.0 - maintenanceMarginRate))
-            -- For Short: liqPrice = (size * entryPrice + totalCollateral) / (size * (1 + mmRate))
-            calcShort = (size * entryPrice + totalCollateral) / (size * (1.0 + maintenanceMarginRate))
-          in
-            case side of
-              -- Liquidation price cannot be negative.
-              Long -> if calcLong < 0.0 then 0.0 else calcLong
-              Short -> if calcShort < 0.0 then 0.0 else calcShort
+    -- View for other contracts to query position details without seeing the full contract.
+    interface instance View for PositionView where
+      view = PositionView with ..
 
-    -- | A non-consuming choice that allows the trader or operator to query the
-    -- | current health and calculated metrics of the position.
-    nonconsuming choice View: PositionView
+    nonconsuming choice UpdateCollateral : ContractId Position
+      -- Allows the operator to update the position's collateral value (for cross-margin)
+      -- and recalculate the liquidation price based on external data (e.g., vault balance change).
+      -- This is critical for keeping cross-margin positions' liquidation prices accurate.
       with
-        markPrice: Decimal
-        maintenanceMarginRate: Decimal
-      controller trader, operator
-      do
-        let pnl = calculatePnl markPrice
-        let effectiveCollateral = collateral + fundingAccrued
-        let marginValue = effectiveCollateral + pnl
-        let notionalValue = size * markPrice
-        let marginRatio = if notionalValue == 0.0 then 0.0 else marginValue / notionalValue
-        let liquidationPrice = calculateLiquidationPrice' effectiveCollateral maintenanceMarginRate
-        return PositionView with
-          operator, trader, marketId, side, size, collateral, entryPrice,
-          markPrice, pnl, fundingAccrued, effectiveCollateral, marginValue,
-          notionalValue, marginRatio, liquidationPrice
-
-    -- | Allows the trader to add or remove collateral from their position.
-    -- `delta` is positive to add collateral and negative to remove it.
-    choice AdjustCollateral: ContractId Position
-      with
-        delta: Decimal                 -- ^ Amount of collateral to add (+) or remove (-).
-        markPrice: Decimal             -- ^ Current mark price, used for margin checks.
-        maintenanceMarginRate: Decimal -- ^ The maintenance margin rate for the market.
-      controller trader
-      do
-        let newCollateral = collateral + delta
-        assertMsg "New collateral amount must be positive" $ newCollateral > 0.0
-
-        -- When removing collateral, we must ensure the position remains sufficiently capitalized
-        -- to avoid immediate liquidation. The new margin ratio must be above the maintenance level.
-        when (delta < 0.0) do
-          let newEffectiveCollateral = newCollateral + fundingAccrued
-          let pnl = calculatePnl markPrice
-          let newMarginValue = newEffectiveCollateral + pnl
-          let notionalValue = size * markPrice
-          let newMarginRatio = if notionalValue == 0.0 then 0.0 else newMarginValue / notionalValue
-
-          assertMsg "Withdrawal would bring margin ratio below maintenance level"
-            (newMarginRatio > maintenanceMarginRate)
-
-        create this with collateral = newCollateral
-
-    -- | Allows the operator to apply a funding payment to the position.
-    -- This is typically called periodically (e.g., every hour).
-    choice UpdateFunding: ContractId Position
-      with
-        fundingPayment: Decimal     -- ^ The funding payment for this period (+ve is received by trader).
-        updateTimestamp: Time       -- ^ The timestamp of this funding update.
+        newCollateralValue : Decimal
+        maintenanceMarginRate : Decimal
       controller operator
       do
-        assertMsg "Update timestamp must be after the last funding timestamp" $
-          updateTimestamp > lastFundingTimestamp
+        assertMsg "Collateral value must be non-negative" $ newCollateralValue >= 0.0
+        assertMsg "This choice is only for cross-margin positions" $ marginMode == Cross
+
+        let newTotalMargin = newCollateralValue + fundingAccrued - protocolFee
+        let newLiqPrice = calculateLiquidationPrice MaintenanceMargin with
+                              notionalValue = entryValue
+                              totalMargin = newTotalMargin
+                              size
+                              side
+                              maintenanceMarginRate
+        create this with
+          collateralValue = newCollateralValue
+          liquidationPrice = newLiqPrice
+
+    choice UpdateIsolatedMargin : ContractId Position
+      -- Add or remove margin from an ISOLATED position.
+      -- Removing margin is represented by a negative `amount`.
+      with
+        amount : Decimal
+        maintenanceMarginRate : Decimal
+        newVaultCid : ContractId MarginVault -- The vault after the margin change.
+      controller trader
+      do
+        assertMsg "Margin updates via this choice only allowed for isolated positions" $
+          marginMode == Isolated
+
+        let newIsolatedMargin = isolatedMargin + amount
+        let newTotalMargin = newIsolatedMargin + fundingAccrued - protocolFee
+
+        let maintenanceMargin = entryValue * maintenanceMarginRate
+        assertMsg "Insufficient margin after update. Withdrawal amount is too large." $
+          newTotalMargin >= maintenanceMargin
+
+        let newLiqPrice = calculateLiquidationPrice MaintenanceMargin with
+                              notionalValue = entryValue
+                              totalMargin = newTotalMargin
+                              size
+                              side
+                              maintenanceMarginRate
+        create this with
+          isolatedMargin = newIsolatedMargin
+          collateralValue = newIsolatedMargin
+          liquidationPrice = newLiqPrice
+          marginVaultCid = newVaultCid
+
+    choice AdjustPosition : ContractId Position
+      -- Internal choice for operator to update position state after a trade execution.
+      -- This can be used to increase, decrease, or partially close a position.
+      with
+        newSize : Decimal
+        avgExecutionPrice : Decimal
+        newCollateralValue : Decimal -- For Cross: new vault balance. For Isolated: new isolated margin.
+        maintenanceMarginRate : Decimal
+      controller operator
+      do
+        assertMsg "New size must be positive" $ newSize > 0.0
+        assertMsg "Average execution price must be positive" $ avgExecutionPrice > 0.0
+        assertMsg "New collateral value must be non-negative" $ newCollateralValue >= 0.0
+
+        let newEntryValue = newSize * avgExecutionPrice
+        let newTotalMargin = newCollateralValue + fundingAccrued - protocolFee
+
+        let newLiqPrice = calculateLiquidationPrice MaintenanceMargin with
+                              notionalValue = newEntryValue
+                              totalMargin = newTotalMargin
+                              size = newSize
+                              side
+                              maintenanceMarginRate
+        create this with
+          size = newSize
+          entryPrice = avgExecutionPrice
+          entryValue = newEntryValue
+          collateralValue = newCollateralValue
+          isolatedMargin = if marginMode == Isolated then newCollateralValue else 0.0
+          liquidationPrice = newLiqPrice
+
+    choice ApplyFunding : ContractId Position
+      -- Applies a funding payment to the position.
+      -- Can be positive (payment to trader) or negative (payment from trader).
+      with
+        fundingPayment : Decimal
+        markPrice: Decimal
+        maintenanceMarginRate : Decimal
+        timestamp: Time
+      controller operator
+      do
+        let newFundingAccrued = fundingAccrued + fundingPayment
+        let newTotalMargin = collateralValue + newFundingAccrued - protocolFee
+        let notionalValue = size * markPrice -- Funding is based on current notional
+
+        let maintenanceMargin = notionalValue * maintenanceMarginRate
+        assertMsg "Position would be undercollateralized after funding payment" $
+          newTotalMargin >= maintenanceMargin
+
+        -- Liquidation price is based on entry notional value
+        let newLiqPrice = calculateLiquidationPrice MaintenanceMargin with
+                              notionalValue = entryValue
+                              totalMargin = newTotalMargin
+                              size
+                              side
+                              maintenanceMarginRate
 
         create this with
-          fundingAccrued = fundingAccrued + fundingPayment
-          lastFundingTimestamp = updateTimestamp
+          fundingAccrued = newFundingAccrued
+          liquidationPrice = newLiqPrice
+          lastFundingTimestamp = timestamp
 
-test = script do
-  op <- allocateParty "Operator"
-  alice <- allocateParty "Alice"
+    choice SwitchMarginMode : ContractId Position
+      -- Allows the trader to switch between Isolated and Cross margin modes.
+      with
+        newMode : MarginMode
+        vaultBalance : Decimal
+        marginToIsolate : Optional Decimal -- Must be Some when switching to Isolated
+        maintenanceMarginRate : Decimal
+      controller trader
+      do
+        case (marginMode, newMode) of
+          (Isolated, Cross) -> do
+            -- Switching from Isolated to Cross.
+            -- The isolated margin is released to the cross-margin pool (the vault).
+            let newTotalMargin = vaultBalance + fundingAccrued - protocolFee
+            let newLiqPrice = calculateLiquidationPrice MaintenanceMargin with
+                                  notionalValue = entryValue, totalMargin = newTotalMargin
+                                  size, side, maintenanceMarginRate
 
-  let now = time (DA.Date.date 2024 DA.Date.Jan 1) 0 0 0
+            -- Ensure the vault has enough to cover maintenance margin after switch
+            let maintenanceMargin = entryValue * maintenanceMarginRate
+            assertMsg "Insufficient cross margin to support position" $
+              newTotalMargin >= maintenanceMargin
 
-  let initialPos = Position with
-        operator = op
-        trader = alice
-        marketId = "ETH-USD"
-        side = Long
-        size = 10.0 -- 10 ETH
-        collateral = 2000.0 -- 2000 USD
-        entryPrice = 2000.0 -- Entered at $2000/ETH
-        fundingAccrued = 0.0
-        lastFundingTimestamp = now
+            create this with
+              marginMode = Cross, isolatedMargin = 0.0, collateralValue = vaultBalance
+              liquidationPrice = newLiqPrice
 
-  posCid <- submit op do create initialPos
+          (Cross, Isolated) -> do
+            -- Switching from Cross to Isolated.
+            assertMsg "Must specify a positive amount of margin to isolate" $
+              isSome marginToIsolate && fromSome marginToIsolate > 0.0
+            let newIsoMargin = fromSome marginToIsolate
 
-  -- Test View choice
-  let markPrice1 = 2100.0
-  let mmRate = 0.05 -- 5%
-  view1 <- submit alice do exercise posCid View with markPrice = markPrice1, maintenanceMarginRate = mmRate
+            -- Ensure the isolated amount is sufficient for maintenance
+            let maintenanceMargin = entryValue * maintenanceMarginRate
+            assertMsg ("Isolated margin " <> show newIsoMargin <> " is below maintenance margin " <> show maintenanceMargin) $
+              newIsoMargin >= maintenanceMargin
 
-  view1.pnl === 1000.0 -- 10.0 * (2100.0 - 2000.0)
-  view1.notionalValue === 21000.0 -- 10.0 * 2100.0
-  view1.marginValue === 3000.0 -- 2000.0 (collateral) + 1000.0 (pnl)
-  -- liqPrice = (10*2000 - 2000) / (10*(1-0.05)) = 18000 / 9.5 = 1894.7368421053
-  (round (view1.liquidationPrice * 10.0^10)) === 18947368421053
+            -- After isolating, the remaining vault balance must not be negative
+            let remainingVaultBalance = vaultBalance - newIsoMargin
+            assertMsg "Isolating margin would leave insufficient funds in cross-margin vault" $
+              remainingVaultBalance >= 0.0
 
-  -- Test AdjustCollateral (add)
-  posCid2 <- submit alice do exercise posCid AdjustCollateral with delta = 500.0, markPrice = markPrice1, maintenanceMarginRate = mmRate
+            let newTotalMargin = newIsoMargin + fundingAccrued - protocolFee
+            let newLiqPrice = calculateLiquidationPrice MaintenanceMargin with
+                                  notionalValue = entryValue, totalMargin = newTotalMargin
+                                  size, side, maintenanceMarginRate
 
-  -- Test AdjustCollateral (remove) - should fail if it goes below maintenance
-  let markPrice2 = 1900.0
-  -- pnl = 10 * (1900 - 2000) = -1000
-  -- collateral = 2500
-  -- marginValue = 2500 - 1000 = 1500
-  -- notional = 10 * 1900 = 19000
-  -- marginRatio = 1500 / 19000 = 0.0789... which is > 0.05, so it's healthy
-  -- Let's try to remove 1000.
-  -- newCollateral = 1500
-  -- newMarginValue = 1500 - 1000 = 500
-  -- newMarginRatio = 500 / 19000 = 0.0263... which is < 0.05. This must fail.
-  submitMustFail alice do exercise posCid2 AdjustCollateral with delta = -1000.0, markPrice = markPrice2, maintenanceMarginRate = mmRate
+            create this with
+              marginMode = Isolated, isolatedMargin = newIsoMargin, collateralValue = newIsoMargin
+              liquidationPrice = newLiqPrice
 
-  -- A safe removal
-  posCid3 <- submit alice do exercise posCid2 AdjustCollateral with delta = -200.0, markPrice = markPrice2, maintenanceMarginRate = mmRate
-
-  -- Test UpdateFunding
-  let fundingTime = DA.Time.addRelTime now (seconds 3600)
-  posCid4 <- submit op do exercise posCid3 UpdateFunding with fundingPayment = -5.25, updateTimestamp = fundingTime
-
-  fetchedPos <- queryContractId alice posCid4
-  fetchedPos.fundingAccrued === -5.25
-
-  return ()
+          _ -> abort "Invalid margin mode transition: cannot switch to the same mode"
